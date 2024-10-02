@@ -12,4 +12,4 @@ First install all the required packages using the code:
 pip install -r requirements.txt
 ``
 
-We use the [LAVIS](https://github.com/salesforce/LAVIS) library to run the experiments. 
+We acknowledge the [LAVIS](https://github.com/salesforce/LAVIS) library that we utilize to run the experiments. 
