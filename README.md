@@ -1,13 +1,15 @@
-## BLIPEE: Fast and Robust BLIP with Adversarially Trained Early Exits
+# BLIPEE: Fast and Robust BLIP with Adversarially Trained Early Exits
 
 This repository is the official implementation of BLIPEE.
 
 For training on various tasks there are different files that could be executed using "python filename.py". Note that the dataset needs to be downloaded and requirement is only the latest transformer and LAVIS library.
 
-# Requirements
+## Requirements
 
 First install all the required packages using the code:
 
 ``
 pip install -r requirements.txt
 ``
+
+We use the [LAVIS](https://github.com/salesforce/LAVIS) library to run the experiments. 
