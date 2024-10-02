@@ -3,3 +3,11 @@
 This repository is the official implementation of BLIPEE.
 
 For training on various tasks there are different files that could be executed using "python filename.py". Note that the dataset needs to be downloaded and requirement is only the latest transformer and LAVIS library.
+
+# Requirements
+
+First install all the required packages using the code:
+
+``
+pip install -r requirements.txt
+``
