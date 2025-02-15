@@ -179,7 +179,22 @@ class IntermediateHead(nn.Module):
         
         return output.view(transformer_output.size(0), -1, output.size(-1))
 
-# Example usage:
+
+class Discriminator(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+
+# usage:
 input_size =2560 # Example input size
 hidden_size = 5072  # Example hidden size
 output_size = 50272  # Example output size
@@ -220,84 +235,117 @@ scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=100, num
 
 kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean')
 
-intermediate_heads.train()
-# model.train()
+
+
+
+intermediate_heads = nn.ModuleList([IntermediateHead(input_size, hidden_size, output_size, num_layers, num_heads, dropout) for _ in layers_for_exit])
+discriminator = Discriminator(input_size, hidden_size)
+
+opt_int = AdamW(intermediate_heads.parameters(), lr=1e-4)
+opt_disc = AdamW(discriminator.parameters(), lr=1e-4)
+criterion = nn.BCELoss()
+
 for epoch in range(num_epochs):
-    # set the model to training model
-    # initialize the training loss
-    train_loss = 0
-    for idx, batch in enumerate((train_dataloader)):
-        print("Samples Processed", idx)
-        input_ids = batch.pop("input_ids").to(device)
-        # input_ids_new = batch.pop("input_ids_new").to(device)
-        pixel_values = batch.pop("pixel_values").to(device, torch.float16)
-        labels=input_ids
-      # forward pass
-        outputs = model(input_ids=input_ids,
-                        pixel_values=pixel_values,
-                        labels=input_ids, output_hidden_states= True)
-        # print(outputs.language_model_outputs.keys())
-        int_loss_train = 0
-        for exit in range(len(layers_for_exit)):
-            intermediate_head = intermediate_heads[exit]
-            intermediate_head = intermediate_head.to(device)
-            # print(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]].shape)
-            intermediate_logits = intermediate_head(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]])
-            # print(intermediate_logits.shape)
-            intermediate_logits = intermediate_logits[:, :128, :]
-            # pooling_layer = torch.nn.AvgPool1d(kernel_size=2, stride=2)
-            # Pad the sequence to ensure output size is 48
-            # padded_hidden_states = F.pad(intermediate_logits, (0, 0, 0, 1))  # Padding the last dimension by 1
-
-            # Apply pooling to reduce the sequence length
-            # pooled_hidden_states = pooling_layer(padded_hidden_states.transpose(1, 2)).transpose(1, 2)
-            # intermediate_logits = pooling_layer(intermediate_logits.transpose(1, 2)).transpose(1, 2)
-            # print(intermediate_logits.shape)
-            # predictions.extend(intermediate_logits.argmax(dim=-1).tolist())
-            # print(intermediate_logits.argmax(dim=-1))
-            if current_step > 0:
-              generated_caption = processor.batch_decode(intermediate_logits.argmax(dim=-1), skip_special_tokens=True)[0]
-              true_caption = processor.batch_decode(labels, skip_special_tokens=True)[0]
-              with open("generated_captions_visdial.txt", "a") as f:
-                  f.write(f"Exit: {layers_for_exit[exit]}, Caption: {generated_caption}\n")
-                  f.write(f"The true caption is: {true_caption}\n")
-                  
-            new_shape = (-1, intermediate_logits.size(-1))
-
-            # Reshape the tensor using the calculated shape
-            reshaped_logits = intermediate_logits.reshape(new_shape)
-            intermediate_loss = (F.cross_entropy(reshaped_logits, labels.view(-1), ignore_index=-100))
-            # intermediate_loss = (F.cross_entropy(intermediate_logits.view(-1, intermediate_logits.size(-1)), labels.view(-1), ignore_index=-100))
-            # kd_loss = kl_div_loss(outputs.logits, intermediate_logits)
-            int_loss_train+=intermediate_loss#+outputs.loss#+kd_loss#+0.5*outputs.loss
-            # Backpropagate the intermediate loss and accumulate gradients
-          #   intermediate_loss.backward()
-        # get the loss
-        # print(outputs.decoder_hidden_states[layers_for_exit[0]])
-        int_loss_train = int_loss_train / len(layers_for_exit)
-        # backward pass
-        int_loss_train.backward()
-        # save_steps+=1
-        # update the weights
-        optimizer.step()
-        scheduler.step()
-        # zero the gradients
-        optimizer.zero_grad()
-        # log the loss
-        loss_v = int_loss_train.item()
-        train_loss += loss_v
-        # increment the step
-        current_step += 1
-        # log the training loss
-        # summary_writer.add_scalar("train_loss", loss_v, global_step=current_step)
+    for batch in train_dataloader:
+        outputs = model(**batch, output_hidden_states=True)
+        real_features = outputs.hidden_states[-1].detach()
+        fake_features = [head(outputs.hidden_states[l]) for head, l in zip(intermediate_heads, layers_for_exit)]
         
-        if current_step%save_steps==0:
-          print(f"Epoch: {epoch}, Step: {current_step}, Train Loss: {train_loss / save_steps:.4f} " )  
-          intermediate_head_weights_dir = f"./multi_heads_visdial/checkpoint/intermediate_head_weights/-{current_step}"
-          os.makedirs(intermediate_head_weights_dir, exist_ok=True)
+        # Discriminator Training
+        opt_disc.zero_grad()
+        disc_loss = criterion(discriminator(real_features), torch.ones_like(real_features[:, :1])) + \
+                    criterion(torch.cat([discriminator(f) for f in fake_features]), torch.zeros(len(fake_features), 1))
+        disc_loss.backward()
+        opt_disc.step()
+        
+        # Generator (Intermediate Heads) Training
+        opt_int.zero_grad()
+        gen_loss = sum(criterion(discriminator(head(outputs.hidden_states[l])), torch.ones_like(real_features[:, :1]))
+                       for head, l in zip(intermediate_heads, layers_for_exit))
+        gen_loss.backward()
+        opt_int.step()
+        
+    print(f"Epoch {epoch}: Disc Loss {disc_loss.item()}, Gen Loss {gen_loss.item()}")
 
-          # Save the weights of each intermediate head
-          for layer_idx, intermediate_head in enumerate(intermediate_heads):
-              head_path = os.path.join(intermediate_head_weights_dir, f"head_layer_{layers_for_exit[layer_idx]}.pt")
-              torch.save(intermediate_head.state_dict(), head_path)
+
+# intermediate_heads.train()
+# # model.train()
+# for epoch in range(num_epochs):
+#     # set the model to training model
+#     # initialize the training loss
+#     train_loss = 0
+#     for idx, batch in enumerate((train_dataloader)):
+#         print("Samples Processed", idx)
+#         input_ids = batch.pop("input_ids").to(device)
+#         # input_ids_new = batch.pop("input_ids_new").to(device)
+#         pixel_values = batch.pop("pixel_values").to(device, torch.float16)
+#         labels=input_ids
+#       # forward pass
+#         outputs = model(input_ids=input_ids,
+#                         pixel_values=pixel_values,
+#                         labels=input_ids, output_hidden_states= True)
+#         # print(outputs.language_model_outputs.keys())
+#         int_loss_train = 0
+#         for exit in range(len(layers_for_exit)):
+#             intermediate_head = intermediate_heads[exit]
+#             intermediate_head = intermediate_head.to(device)
+#             # print(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]].shape)
+#             intermediate_logits = intermediate_head(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]])
+#             # print(intermediate_logits.shape)
+#             intermediate_logits = intermediate_logits[:, :128, :]
+#             # pooling_layer = torch.nn.AvgPool1d(kernel_size=2, stride=2)
+#             # Pad the sequence to ensure output size is 48
+#             # padded_hidden_states = F.pad(intermediate_logits, (0, 0, 0, 1))  # Padding the last dimension by 1
+
+#             # Apply pooling to reduce the sequence length
+#             # pooled_hidden_states = pooling_layer(padded_hidden_states.transpose(1, 2)).transpose(1, 2)
+#             # intermediate_logits = pooling_layer(intermediate_logits.transpose(1, 2)).transpose(1, 2)
+#             # print(intermediate_logits.shape)
+#             # predictions.extend(intermediate_logits.argmax(dim=-1).tolist())
+#             # print(intermediate_logits.argmax(dim=-1))
+#             if current_step > 0:
+#               generated_caption = processor.batch_decode(intermediate_logits.argmax(dim=-1), skip_special_tokens=True)[0]
+#               true_caption = processor.batch_decode(labels, skip_special_tokens=True)[0]
+#               with open("generated_captions_visdial.txt", "a") as f:
+#                   f.write(f"Exit: {layers_for_exit[exit]}, Caption: {generated_caption}\n")
+#                   f.write(f"The true caption is: {true_caption}\n")
+                  
+#             new_shape = (-1, intermediate_logits.size(-1))
+
+#             # Reshape the tensor using the calculated shape
+#             reshaped_logits = intermediate_logits.reshape(new_shape)
+#             intermediate_loss = (F.cross_entropy(reshaped_logits, labels.view(-1), ignore_index=-100))
+#             # intermediate_loss = (F.cross_entropy(intermediate_logits.view(-1, intermediate_logits.size(-1)), labels.view(-1), ignore_index=-100))
+#             # kd_loss = kl_div_loss(outputs.logits, intermediate_logits)
+#             int_loss_train+=intermediate_loss#+outputs.loss#+kd_loss#+0.5*outputs.loss
+#             # Backpropagate the intermediate loss and accumulate gradients
+#           #   intermediate_loss.backward()
+#         # get the loss
+#         # print(outputs.decoder_hidden_states[layers_for_exit[0]])
+#         int_loss_train = int_loss_train / len(layers_for_exit)
+#         # backward pass
+#         int_loss_train.backward()
+#         # save_steps+=1
+#         # update the weights
+#         optimizer.step()
+#         scheduler.step()
+#         # zero the gradients
+#         optimizer.zero_grad()
+#         # log the loss
+#         loss_v = int_loss_train.item()
+#         train_loss += loss_v
+#         # increment the step
+#         current_step += 1
+#         # log the training loss
+#         # summary_writer.add_scalar("train_loss", loss_v, global_step=current_step)
+        
+#         if current_step%save_steps==0:
+#           print(f"Epoch: {epoch}, Step: {current_step}, Train Loss: {train_loss / save_steps:.4f} " )  
+#           intermediate_head_weights_dir = f"./multi_heads_visdial/checkpoint/intermediate_head_weights/-{current_step}"
+#           os.makedirs(intermediate_head_weights_dir, exist_ok=True)
+
+#           # Save the weights of each intermediate head
+#           for layer_idx, intermediate_head in enumerate(intermediate_heads):
+#               head_path = os.path.join(intermediate_head_weights_dir, f"head_layer_{layers_for_exit[layer_idx]}.pt")
+#               torch.save(intermediate_head.state_dict(), head_path)
 
