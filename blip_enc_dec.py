@@ -101,6 +101,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import TransformerDecoder, TransformerDecoderLayer
 
+import torch
+# from torch.utils.data import Dataset, DataLoader
+from transformers import AutoProcessor
+from PIL import Image
+import numpy as np
+from datasets import load_dataset
+from torch.optim import AdamW
+import tqdm
+import os
+
 class IntermediateHead(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers, num_heads, dropout):
         super(IntermediateHead, self).__init__()
@@ -134,9 +144,24 @@ class IntermediateHead(nn.Module):
         
         return output.view(transformer_output.size(0), -1, output.size(-1))
 
-# Example usage:
-input_size = 2048  # Example input size
-hidden_size = 2048  # Example hidden size
+
+class Discriminator(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+
+# usage:
+input_size =2560 # Example input size
+hidden_size = 5072  # Example hidden size
 output_size = 50272  # Example output size
 num_layers = 2  # Number of decoder layers
 num_heads = 8  # Number of attention heads
@@ -157,7 +182,7 @@ vocab_size = 50272
 # hidden_size = 6072
 num_epochs = 15
 # Create intermediate head modules
-layers_for_exit = [3, 5, 7, 9, 12, 18, 21, 23]
+layers_for_exit = [3, 5, 18, 21, 27]
 # intermediate_heads = nn.ModuleList([IntermediateHead(input_size,hidden_size, vocab_size) for _ in range(len(layers_for_exit))])
 intermediate_heads = nn.ModuleList([IntermediateHead(input_size, hidden_size, output_size, num_layers, num_heads, dropout) for _ in range(len(layers_for_exit))])
 
@@ -165,221 +190,126 @@ intermediate_heads = nn.ModuleList([IntermediateHead(input_size, hidden_size, ou
 
 
 # define the optimizer
-optimizer = AdamW(intermediate_heads.parameters(), lr=1e-5)
+# optimizer = AdamW(intermediate_heads.parameters(), lr=1e-5)
 from transformers import get_linear_schedule_with_warmup
 current_step = 0
-save_steps = 1000
+save_steps = 5000
 optimizer = AdamW(intermediate_heads.parameters(), lr=1e-4)
 n_train_steps = num_epochs * len(train_dataloader)
 scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=100, num_training_steps=n_train_steps)
 
 kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean')
 
-intermediate_heads.train()
-# model.train()
+
+
+
+intermediate_heads = nn.ModuleList([IntermediateHead(input_size, hidden_size, output_size, num_layers, num_heads, dropout) for _ in layers_for_exit])
+discriminator = Discriminator(input_size, hidden_size)
+
+opt_int = AdamW(intermediate_heads.parameters(), lr=1e-4)
+opt_disc = AdamW(discriminator.parameters(), lr=1e-4)
+criterion = nn.BCELoss()
+
 for epoch in range(num_epochs):
-    # set the model to training model
-    # initialize the training loss
-    train_loss = 0
-    print(f'epoch {epoch}/{num_epochs}')
-    for idx, batch in enumerate(tqdm(train_dataloader)):
-        input_ids = batch.pop("input_ids").to(device)
-        pixel_values = batch.pop("pixel_values").to(device, torch.float16)
-        labels=input_ids
-      # forward pass
-        outputs = model(input_ids=input_ids,
-                        pixel_values=pixel_values,
-                        labels=input_ids, output_hidden_states= True)
-        # print(outputs.language_model_outputs.decoder_hidden_states[5].shape)
-        int_loss_train = 0
-        for exit in range(len(layers_for_exit)):
-            intermediate_head = intermediate_heads[exit]
-            intermediate_head = intermediate_head.to(device)
-            # print(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]].shape)
-            intermediate_logits = intermediate_head(outputs.language_model_outputs.decoder_hidden_states[layers_for_exit[exit]])
-            # print(intermediate_logits.shape)
-            # intermediate_logits = intermediate_logits[:, :128, :]
-            # pooling_layer = torch.nn.AvgPool1d(kernel_size=2, stride=2)
-            # Pad the sequence to ensure output size is 48
-            # padded_hidden_states = F.pad(intermediate_logits, (0, 0, 0, 1))  # Padding the last dimension by 1
-
-            # Apply pooling to reduce the sequence length
-            # pooled_hidden_states = pooling_layer(padded_hidden_states.transpose(1, 2)).transpose(1, 2)
-            # intermediate_logits = pooling_layer(intermediate_logits.transpose(1, 2)).transpose(1, 2)
-            # print(intermediate_logits.shape)
-            # predictions.extend(intermediate_logits.argmax(dim=-1).tolist())
-            # print(intermediate_logits.argmax(dim=-1))
-            if current_step > 0:
-              generated_caption = processor.batch_decode(intermediate_logits.argmax(dim=-1), skip_special_tokens=True)[0]
-            #   print(f"The generated caption for exit {layers_for_exit[exit]} is {generated_caption}")
-              # Write the generated caption to a text file
-              with open("generated_captions_enc_dec.txt", "a") as f:
-                  f.write(f"Exit: {layers_for_exit[exit]}, Caption: {generated_caption}\n")
-
-            # print(intermediate_logits.shape)
-            # Calculate cosine similarity loss
-            # Calculate cosine similarity loss
-            # batch_size, seq_len, hidden_size = intermediate_logits.shape
-            # Calculate cosine similarity manually
-            # cosine_similarity = F.cosine_similarity(intermediate_logits, outputs.logits, dim=-1)
-            # cosine_loss = 1 - cosine_similarity.mean()
-            # print( labels.view(-1).shape)
-            intermediate_loss = (F.cross_entropy(intermediate_logits.view(-1, intermediate_logits.size(-1)), labels.view(-1), ignore_index=-100))
-            # kd_loss = kl_div_loss(outputs.logits, intermediate_logits)
-            int_loss_train+=layers_for_exit[exit]*intermediate_loss#+outputs.loss#+kd_loss#+0.5*outputs.loss
-            # Backpropagate the intermediate loss and accumulate gradients
-          #   intermediate_loss.backward()
-        # get the loss
-        # print(outputs.decoder_hidden_states[layers_for_exit[0]])
-        int_loss_train = int_loss_train / len(layers_for_exit)
-        # backward pass
-        int_loss_train.backward()
-        # save_steps+=1
-        # update the weights
-        optimizer.step()
-        scheduler.step()
-        # zero the gradients
-        optimizer.zero_grad()
-        # log the loss
-        loss_v = int_loss_train.item()
-        train_loss += loss_v
-        # increment the step
-        current_step += 1
-        # log the training loss
-        # summary_writer.add_scalar("train_loss", loss_v, global_step=current_step)
+    for batch in train_dataloader:
+        outputs = model(**batch, output_hidden_states=True)
+        real_features = outputs.hidden_states[-1].detach()
+        fake_features = [head(outputs.hidden_states[l]) for head, l in zip(intermediate_heads, layers_for_exit)]
         
-        if current_step%save_steps==0:
-          print(f"Epoch: {epoch}, Step: {current_step}, Train Loss: {train_loss / save_steps:.4f} " )  
-          intermediate_head_weights_dir = f"./multi_heads_enc_dec_new/checkpoint/intermediate_head_weights/-{current_step}"
-          os.makedirs(intermediate_head_weights_dir, exist_ok=True)
-
-          # Save the weights of each intermediate head
-          for layer_idx, intermediate_head in enumerate(intermediate_heads):
-              head_path = os.path.join(intermediate_head_weights_dir, f"head_layer_{layers_for_exit[layer_idx]}.pt")
-              torch.save(intermediate_head.state_dict(), head_path)
-
-
-# import torch
-# from tqdm import tqdm
-# import torch.nn.functional as F
-
-# from torch.optim import AdamW
-# import os
-
-# from torch.utils.tensorboard import SummaryWriter
-
-# summary_writer = SummaryWriter(log_dir="./image-captioning/tensorboard")
-
-# # define the optimizer
-# # optimizer = AdamW(intermediate_heads.parameters(), lr=1e-5)
-# from transformers import get_linear_schedule_with_warmup
-# current_step = 0
-# save_steps = 10000
-# # optimizer = AdamW(intermediate_heads.parameters(), lr=1e-4)
-# n_train_steps = num_epochs * len(train_dataloader)
-# # scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=100, num_training_steps=n_train_steps)
-
-# kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean')
+        # Discriminator Training
+        opt_disc.zero_grad()
+        disc_loss = criterion(discriminator(real_features), torch.ones_like(real_features[:, :1])) + \
+                    criterion(torch.cat([discriminator(f) for f in fake_features]), torch.zeros(len(fake_features), 1))
+        disc_loss.backward()
+        opt_disc.step()
+        
+        # Generator (Intermediate Heads) Training
+        opt_int.zero_grad()
+        gen_loss = sum(criterion(discriminator(head(outputs.hidden_states[l])), torch.ones_like(real_features[:, :1]))
+                       for head, l in zip(intermediate_heads, layers_for_exit))
+        gen_loss.backward()
+        opt_int.step()
+        
+    print(f"Epoch {epoch}: Disc Loss {disc_loss.item()}, Gen Loss {gen_loss.item()}")
 
 
-# # summary_writer = SummaryWriter(log_dir="./image-captioning/tensorboard")
-
-# # Define the optimizer
-# optimizer = AdamW(intermediate_heads.parameters(), lr=1e-5)
-
-# # Define the learning rate scheduler
-# scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1, num_training_steps=n_train_steps)
-
-# # Define the KLDivLoss
-# kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean')
-
-# # Autoregressive training loop
+# intermediate_heads.train()
+# # model.train()
 # for epoch in range(num_epochs):
-#     # Set the model to training mode
-    
-#     # Initialize the training loss
+#     # set the model to training model
+#     # initialize the training loss
 #     train_loss = 0
-    
-#     for idx, batch in enumerate(tqdm(train_dataloader)):
+#     for idx, batch in enumerate((train_dataloader)):
+#         print("Samples Processed", idx)
 #         input_ids = batch.pop("input_ids").to(device)
+#         # input_ids_new = batch.pop("input_ids_new").to(device)
 #         pixel_values = batch.pop("pixel_values").to(device, torch.float16)
-#         labels = input_ids.clone()  # Clone the input_ids to use as labels
-#         # print("\n",idx,"\n")
+#         labels=input_ids
+#       # forward pass
+#         outputs = model(input_ids=input_ids,
+#                         pixel_values=pixel_values,
+#                         labels=input_ids, output_hidden_states= True)
+#         # print(outputs.language_model_outputs.keys())
 #         int_loss_train = 0
-#         label_1 = []
-#         for i in labels[0]:
-#             if i>1:
-#                 label_1.append(i)
-#             else:
-#                 pass
-#         # print(labels.shape)
-#         # print("\n Next token starts here\n")
-#         # print(len(label_1))
-#         outputs = model(input_ids=input_ids, pixel_values=pixel_values, labels=labels, output_hidden_states=True)
-#         # Autoregressive generation loop
-#         for t in range(len(label_1)+3):  # Loop over each token position (except the last one)
-#             # Forward pass
-#             # print(outputs.logits.shape)
-#             # outputs = output
+#         for exit in range(len(layers_for_exit)):
+#             intermediate_head = intermediate_heads[exit]
+#             intermediate_head = intermediate_head.to(device)
+#             # print(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]].shape)
+#             intermediate_logits = intermediate_head(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]])
+#             # print(intermediate_logits.shape)
+#             intermediate_logits = intermediate_logits[:, :128, :]
+#             # pooling_layer = torch.nn.AvgPool1d(kernel_size=2, stride=2)
+#             # Pad the sequence to ensure output size is 48
+#             # padded_hidden_states = F.pad(intermediate_logits, (0, 0, 0, 1))  # Padding the last dimension by 1
 
-#             # Process intermediate heads
-#             for exit in range(len(layers_for_exit)):
-#                 intermediate_head = intermediate_heads[exit].to(device)
-#                 intermediate_logits = intermediate_head(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]])
-#                 intermediate_logits = intermediate_logits
-#                 # print(intermediate_logits.shape)
-#                 # print(outputs.language_model_outputs.hidden_states[25].shape)
-#                 # print(outputs.language_model_outputs.hidden_states[1])
+#             # Apply pooling to reduce the sequence length
+#             # pooled_hidden_states = pooling_layer(padded_hidden_states.transpose(1, 2)).transpose(1, 2)
+#             # intermediate_logits = pooling_layer(intermediate_logits.transpose(1, 2)).transpose(1, 2)
+#             # print(intermediate_logits.shape)
+#             # predictions.extend(intermediate_logits.argmax(dim=-1).tolist())
+#             # print(intermediate_logits.argmax(dim=-1))
+#             if current_step > 0:
+#               generated_caption = processor.batch_decode(intermediate_logits.argmax(dim=-1), skip_special_tokens=True)[0]
+#               true_caption = processor.batch_decode(labels, skip_special_tokens=True)[0]
+#               with open("generated_captions_visdial.txt", "a") as f:
+#                   f.write(f"Exit: {layers_for_exit[exit]}, Caption: {generated_caption}\n")
+#                   f.write(f"The true caption is: {true_caption}\n")
+                  
+#             new_shape = (-1, intermediate_logits.size(-1))
 
-#                 # Calculate intermediate loss
-#                 # autoregressive_labels = labels.clone()
-#                 # Update labels for autoregressive generation
-#                 # Update labels for autoregressive generation
-#                 autoregressive_labels = labels.clone()
-#                   # Mask out future tokens beyond the current position
-#                 autoregressive_labels[:, t+1:] = -100
-#                 # print(autoregressive_labels)
-
-#                 # Compute the logits and reshape them
-#                 logits_shape = intermediate_logits.shape
-#                 intermediate_logits_flat = intermediate_logits.view(-1, logits_shape[-1])
-#                 # print(intermediate_logits)
-
-#                 # Flatten the autoregressive labels tensor
-#                 autoregressive_labels_flat = autoregressive_labels.view(-1)
-#                 # print(autoregressive_labels_flat.shape)
-#                 generated_caption = processor.batch_decode(intermediate_logits.argmax(dim=-1), skip_special_tokens=True)[0]
-#                 # print(f"The generated caption for exit {layers_for_exit[exit]} is {generated_caption}")
-
-#                 # Compute the cross-entropy loss
-#                 intermediate_loss = 128*F.cross_entropy(intermediate_logits_flat[t], autoregressive_labels_flat[t], ignore_index=-100)
-
-#                 # Accumulate the loss
-#                 int_loss_train += intermediate_loss
-#         int_loss_train+=outputs.loss
-#         # Backpropagate the intermediate loss
+#             # Reshape the tensor using the calculated shape
+#             reshaped_logits = intermediate_logits.reshape(new_shape)
+#             intermediate_loss = (F.cross_entropy(reshaped_logits, labels.view(-1), ignore_index=-100))
+#             # intermediate_loss = (F.cross_entropy(intermediate_logits.view(-1, intermediate_logits.size(-1)), labels.view(-1), ignore_index=-100))
+#             # kd_loss = kl_div_loss(outputs.logits, intermediate_logits)
+#             int_loss_train+=intermediate_loss#+outputs.loss#+kd_loss#+0.5*outputs.loss
+#             # Backpropagate the intermediate loss and accumulate gradients
+#           #   intermediate_loss.backward()
+#         # get the loss
+#         # print(outputs.decoder_hidden_states[layers_for_exit[0]])
+#         int_loss_train = int_loss_train / len(layers_for_exit)
+#         # backward pass
 #         int_loss_train.backward()
-#         with open("generated_captions_auto_dec_unfrozen.txt", "a") as f:
-#                   f.write(f"index is :{idx}, Exit: {layers_for_exit[exit]}, Caption: {generated_caption}\n")
-        
-#         # Update the weights
+#         # save_steps+=1
+#         # update the weights
 #         optimizer.step()
 #         scheduler.step()
+#         # zero the gradients
 #         optimizer.zero_grad()
-        
-#         # Log the loss
-#         loss_v = intermediate_loss.item()
+#         # log the loss
+#         loss_v = int_loss_train.item()
 #         train_loss += loss_v
+#         # increment the step
+#         current_step += 1
+#         # log the training loss
 #         # summary_writer.add_scalar("train_loss", loss_v, global_step=current_step)
-                
-#         # Log the epoch training loss
-#         print(f"Epoch: {epoch}, Train Loss: {train_loss / len(train_dataloader):.4f}")
-    
-#     # Save intermediate head weights
-#     if epoch % save_steps == 0:
-#         intermediate_head_weights_dir = f"./multi_heads/checkpoint/intermediate_head_weights/epoch-{epoch}"
-#         os.makedirs(intermediate_head_weights_dir, exist_ok=True)
         
-#         for layer_idx, intermediate_head in enumerate(intermediate_heads):
-#             head_path = os.path.join(intermediate_head_weights_dir, f"head_layer_{layers_for_exit[layer_idx]}.pt")
-#             torch.save(intermediate_head.state_dict(), head_path)
+#         if current_step%save_steps==0:
+#           print(f"Epoch: {epoch}, Step: {current_step}, Train Loss: {train_loss / save_steps:.4f} " )  
+#           intermediate_head_weights_dir = f"./multi_heads_visdial/checkpoint/intermediate_head_weights/-{current_step}"
+#           os.makedirs(intermediate_head_weights_dir, exist_ok=True)
+
+#           # Save the weights of each intermediate head
+#           for layer_idx, intermediate_head in enumerate(intermediate_heads):
+#               head_path = os.path.join(intermediate_head_weights_dir, f"head_layer_{layers_for_exit[layer_idx]}.pt")
+#               torch.save(intermediate_head.state_dict(), head_path)
