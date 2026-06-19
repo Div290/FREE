@@ -1,57 +1,6 @@
 """
 Adversarial early-exit distillation for BLIP-2 (multi-GPU).
 
-Goal
-----
-BLIP-2 (Salesforce/blip2-opt-2.7b, fp16) stays FROZEN. For each chosen decoder
-layer `l`, an `IntermediateHead` learns to map that layer's hidden states into
-a vector that a shared `Discriminator` cannot distinguish from the model's
-final-layer hidden states (per-token, GAN-style adversarial distillation).
-At inference time you could exit early at layer `l` and use the matching head
-to get a "final-layer-like" representation cheaply.
-
-Fixes vs. the original draft
------------------------------
-1. Removed duplicate/dead head+optimizer+scheduler definitions and the unused
-   KLDivLoss / LoRA / get_linear_schedule_with_warmup imports.
-2. BLIP-2 is explicitly frozen (`requires_grad_(False)`, `model.eval()`) since
-   only the heads + discriminator train, per your decision. LoRA removed.
-3. `Graphcore/vqa`'s `image_id` is a *string* COCO id, not a path or URL
-   (confirmed against the HF VQA tutorial, which does
-   `Image.open(example["image_id"])` against locally-staged COCO val2014
-   files). Since we want on-the-fly fetching with no pre-downloaded zip, we
-   build the COCO val2014 URL from the id and HTTP-fetch + disk-cache each
-   image the first time it's used.
-4. `collate_fn` no longer silently overwrites the *question* `input_ids`/
-   `attention_mask` with the *answer*'s. Question and answer are now kept as
-   separate keys (`input_ids`/`attention_mask` for the prompt that BLIP-2
-   actually conditions on, `labels` for supervision) so nothing is dropped.
-5. `dataset.filter` to drop empty-answer examples now runs via a writable
-   in-memory mask, not against a read-only HF dataset object identity issue.
-6. Discriminator now operates per-token (per your choice) with the correct
-   tensor shapes: real/fake features are (batch, seq_len, hidden) ->
-   discriminator outputs (batch, seq_len, 1) -> labels are
-   torch.ones/zeros_like(that exact shape), not the previous shape-mismatched
-   `real_features[:, :1]` / `torch.zeros(len(fake_features), 1)` which would
-   have raised a runtime error or silently broadcast incorrectly.
-7. Concatenating predictions from heads attached to *different* layers used
-   to be `torch.cat([...], dim=0)` then compared against a labels tensor with
-   the wrong shape entirely; now each head's fake-vs-real loss is computed
-   and accumulated independently, which is also the correct GAN formulation
-   here (you want every head to fool the discriminator, not to treat the
-   batch as if it were `num_heads` larger).
-8. All tensors are explicitly moved to the right device every step. Since
-   you're on multi-GPU, the script uses Accelerate's `Accelerator` to handle
-   device placement / multi-GPU training cleanly instead of manual
-   `dispatch_model` + `infer_auto_device_map`, which doesn't compose well
-   with a manual training loop and new trainable submodules that live outside
-   the dispatched model.
-9. Added an actual epoch-level average loss print, gradient clipping, and
-   checkpoint saving for `intermediate_heads` (the artifact you presumably
-   want to keep).
-10. Batch's `pixel_values` are cast to fp16 to match the frozen BLIP-2 model
-    dtype; previously dtype mismatches between batch tensors and the model
-    were never addressed.
 
 Install
 -------
