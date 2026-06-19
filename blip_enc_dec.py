@@ -1,22 +1,6 @@
 """
 Early-Exit GAN Training — BLIP2-Flan-T5-xl on COCO Captions
 =============================================================
-Fixes over the original file
------------------------------
-1.  intermediate_heads defined ONCE (was defined twice, second overwriting first).
-2.  Discriminator input flattened correctly: (B, seq_len, d) → (B*seq_len, d)
-    so BCELoss targets are the right shape.
-3.  fake_features computed once per batch and reused for both disc and gen losses
-    (original re-ran all heads a second time inside gen_loss).
-4.  input_size corrected to 2048  (Flan-T5-xl hidden dim, not OPT's 2560).
-5.  output_size corrected to 32128 (Flan-T5-xl vocab size, not OPT's 50272).
-6.  Hidden states pulled from the T5 *decoder* (outputs.decoder_hidden_states),
-    not the generic outputs.hidden_states which is the encoder for seq2seq models.
-7.  Batch tensors moved to device before each forward pass.
-8.  Backbone frozen with model.eval() + torch.no_grad() — we only train heads.
-9.  Intermediate heads and discriminator moved to device.
-10. Checkpoint saving wired up (save_steps was defined but never used).
-11. Stale / duplicate imports removed; tqdm used consistently.
 """
 
 import pickle
