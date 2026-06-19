@@ -1,20 +1,6 @@
 """
 Early Exit Inference for BLIP2 + LoRA + IntermediateHeads (VisDial)
 =====================================================================
-Architecture recap
-------------------
-- Backbone  : BLIP2-OPT-2.7b (fp16, sharded), fine-tuned with LoRA
-- Exit heads: 5 x IntermediateHead (Transformer-decoder + linear classifier)
-              attached to OPT decoder layers [3, 5, 18, 21, 27]
-- Training  : GAN-style — heads learn to mimic the last hidden state's
-              distribution so their logits are "as good" as the full model.
-
-Early-exit strategy (confidence-based)
----------------------------------------
-At each exit layer we compute a confidence score on the head's output logits.
-If confidence >= threshold we exit early and return that head's prediction.
-If no exit fires, we fall back to the full model's final output.
-
 Supported confidence metrics
 -----------------------------
   "max_prob"  – max softmax probability          (fast, standard)
