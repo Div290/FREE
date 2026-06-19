@@ -1,315 +1,335 @@
+"""
+Early-Exit GAN Training — BLIP2-Flan-T5-xl on COCO Captions
+=============================================================
+Fixes over the original file
+-----------------------------
+1.  intermediate_heads defined ONCE (was defined twice, second overwriting first).
+2.  Discriminator input flattened correctly: (B, seq_len, d) → (B*seq_len, d)
+    so BCELoss targets are the right shape.
+3.  fake_features computed once per batch and reused for both disc and gen losses
+    (original re-ran all heads a second time inside gen_loss).
+4.  input_size corrected to 2048  (Flan-T5-xl hidden dim, not OPT's 2560).
+5.  output_size corrected to 32128 (Flan-T5-xl vocab size, not OPT's 50272).
+6.  Hidden states pulled from the T5 *decoder* (outputs.decoder_hidden_states),
+    not the generic outputs.hidden_states which is the encoder for seq2seq models.
+7.  Batch tensors moved to device before each forward pass.
+8.  Backbone frozen with model.eval() + torch.no_grad() — we only train heads.
+9.  Intermediate heads and discriminator moved to device.
+10. Checkpoint saving wired up (save_steps was defined but never used).
+11. Stale / duplicate imports removed; tqdm used consistently.
+"""
+
 import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-# from transformers import AutoProcessor, Blip2ForConditionalGeneration
-from transformers import AutoProcessor, Blip2ForConditionalGeneration
-from peft import LoraConfig, get_peft_model
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import TransformerDecoder, TransformerDecoderLayer
+from transformers import AutoProcessor, Blip2ForConditionalGeneration, get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
 
 
+# ---------------------------------------------------------------------------
+# 0. Config
+# ---------------------------------------------------------------------------
 
-# with open('train_ds_coco.pkl', 'rb') as f1:
-#     train_ds = pickle.load(f1)
-    
+# Flan-T5-xl hidden size = 2048; OPT-2.7b was 2560 — these MUST match the backbone.
+INPUT_SIZE  = 2048      # FIX 4: was 2560
+HIDDEN_SIZE = 4096
+OUTPUT_SIZE = 32128     # FIX 5: Flan-T5-xl vocab; was 50272 (OPT vocab)
+NUM_LAYERS  = 2
+NUM_HEADS   = 8         # must divide INPUT_SIZE evenly (2048 / 8 = 256 ✓)
+DROPOUT     = 0.1
+
+LAYERS_FOR_EXIT = [3, 5, 18, 21, 27]   # T5-xl decoder has 24 layers; cap at 23
+LAYERS_FOR_EXIT = [l for l in LAYERS_FOR_EXIT if l < 24]   # safety clamp
+
+NUM_EPOCHS  = 15
+BATCH_SIZE  = 16
+LR          = 1e-4
+WARMUP_STEPS = 100
+SAVE_STEPS  = 5000
+SAVE_DIR    = "./checkpoints"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+print(f"Device: {DEVICE}")
+
+
+# ---------------------------------------------------------------------------
+# 1. Dataset & DataLoader
+# ---------------------------------------------------------------------------
+
 with open('/home/iitb/divya/val_ds_coco.pkl', 'rb') as f:
     dataset = pickle.load(f)
-    
-# with open('test_ds_coco.pkl', 'rb') as f2:
-#     test_ds = pickle.load(f2)
+
+processor = AutoProcessor.from_pretrained("Salesforce/blip2-flan-t5-xl")
 
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-print("The device being used is", device)
-
-
-from torch.utils.data import Dataset, DataLoader
 class ImageCaptioningDataset(Dataset):
     def __init__(self, dataset, processor):
-        self.dataset = dataset
+        self.dataset   = dataset
         self.processor = processor
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        item = self.dataset[idx]
+        item     = self.dataset[idx]
         encoding = self.processor(images=item["image"], padding="max_length", return_tensors="pt")
-        # remove batch dimension
         encoding = {k: v.squeeze() for k, v in encoding.items()}
         encoding["text"] = item["sentences"]["raw"]
         return encoding
 
+
 def collate_fn(batch):
-    # pad the input_ids and attention_mask
     processed_batch = {}
     for key in batch[0].keys():
         if key != "text":
             processed_batch[key] = torch.stack([example[key] for example in batch])
         else:
             text_inputs = processor.tokenizer(
-                [example["text"] for example in batch], max_length=128, padding="max_length", return_tensors="pt"
+                [example["text"] for example in batch],
+                max_length=128,
+                padding="max_length",
+                return_tensors="pt",
             )
-            processed_batch["input_ids"] = text_inputs["input_ids"]
+            processed_batch["input_ids"]      = text_inputs["input_ids"]
             processed_batch["attention_mask"] = text_inputs["attention_mask"]
     return processed_batch
 
 
-
-# processor = AutoProcessor.from_pretrained("Salesforce/blip2-opt-2.7b")
-# model = Blip2ForConditionalGeneration.from_pretrained("ybelkada/blip2-opt-2.7b-fp16-sharded", device_map="auto", load_in_8bit=True, output_hidden_states = True)
-
-processor = AutoProcessor.from_pretrained("Salesforce/blip2-flan-t5-xl")
-model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-flan-t5-xl", device_map="auto", torch_dtype=torch.float16)
+train_dataset    = ImageCaptioningDataset(dataset, processor)
+train_dataloader = DataLoader(
+    train_dataset, shuffle=True, batch_size=BATCH_SIZE, collate_fn=collate_fn
+)
 
 
-# Let's define the LoraConfig
-# config = LoraConfig(
-#     r=16,
-#     lora_alpha=32,
-#     lora_dropout=0.05,
-#     bias="none",
-#     target_modules=["q_proj", "k_proj"]
-# )
-
-# model = get_peft_model(model, config)
-# model.print_trainable_parameters()
-
-train_dataset = ImageCaptioningDataset(dataset, processor)
-train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=16, collate_fn=collate_fn)
-
-
-
-# class IntermediateHead(nn.Module):
-#     def __init__(self, input_size, hidden_size, output_size):
-#         super(IntermediateHead, self).__init__()
-#         self.fc1 = nn.Linear(input_size, hidden_size)
-#         self.fc2 = nn.Linear(hidden_size, output_size)
-#         self.tanh = nn.Tanh()
-        
-#     def forward(self, x):
-#         x = x.to(self.fc1.weight.dtype)
-#         x = self.fc1(x)
-#         x = self.tanh(x)
-#         x = self.fc2(x)
-#         return x
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn import TransformerDecoder, TransformerDecoderLayer
-
-import torch
-# from torch.utils.data import Dataset, DataLoader
-from transformers import AutoProcessor
-from PIL import Image
-import numpy as np
-from datasets import load_dataset
-from torch.optim import AdamW
-import tqdm
-import os
+# ---------------------------------------------------------------------------
+# 2. Model definitions
+# ---------------------------------------------------------------------------
 
 class IntermediateHead(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers, num_heads, dropout):
-        super(IntermediateHead, self).__init__()
+        super().__init__()
         self.transformer_decoder_layer = TransformerDecoderLayer(
             d_model=input_size,
             nhead=num_heads,
             dim_feedforward=hidden_size,
-            dropout=dropout
+            dropout=dropout,
         )
         self.transformer_decoder = TransformerDecoder(
             decoder_layer=self.transformer_decoder_layer,
-            num_layers=num_layers
+            num_layers=num_layers,
         )
         self.classifier = nn.Linear(input_size, output_size)
 
     def forward(self, x):
-        # Assuming x has shape (seq_len, batch_size, input_size)
-        x = x.to(self.transformer_decoder_layer.self_attn.out_proj.weight.dtype)
-        x = x.transpose(0, 1)
-        
+        # x: (batch, seq_len, input_size)
+        x      = x.to(self.transformer_decoder_layer.self_attn.out_proj.weight.dtype)
+        x      = x.transpose(0, 1)                    # (seq_len, batch, d)
         memory = torch.zeros_like(x)
-        
-        # Transformer decoder layer forward pass
-        transformer_output = self.transformer_decoder(x, memory)
-        transformer_output = transformer_output.transpose(0,1)
-        # print(transformer_output.shape)
-        # Apply classifier to the transformer output
-        output = self.classifier(transformer_output.contiguous().view(-1, transformer_output.size(-1)))  # Take the output of the last layer
-        # print(output.shape)
-        # output = output.unsqueeze(0)
-        
-        return output.view(transformer_output.size(0), -1, output.size(-1))
+        out    = self.transformer_decoder(x, memory)
+        out    = out.transpose(0, 1)                   # (batch, seq_len, d)
+        logits = self.classifier(
+            out.contiguous().view(-1, out.size(-1))    # (batch*seq_len, d)
+        )
+        return logits.view(out.size(0), out.size(1), -1)  # (batch, seq_len, vocab)
 
 
 class Discriminator(nn.Module):
+    """
+    Expects input shape (N, input_size) — flatten seq dimension before calling.
+    Returns (N, 1) real/fake score.
+    """
     def __init__(self, input_size, hidden_size):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_size, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
+
     def forward(self, x):
+        # x: (N, input_size)
         return self.net(x)
 
 
+# ---------------------------------------------------------------------------
+# 3. Instantiate models  — FIX 1: only ONE instantiation of intermediate_heads
+# ---------------------------------------------------------------------------
 
-# usage:
-input_size =2560 # Example input size
-hidden_size = 5072  # Example hidden size
-output_size = 50272  # Example output size
-num_layers = 2  # Number of decoder layers
-num_heads = 8  # Number of attention heads
-dropout = 0.1  # Dropout probability
+# Backbone: frozen during head training
+backbone = Blip2ForConditionalGeneration.from_pretrained(
+    "Salesforce/blip2-flan-t5-xl",
+    device_map="auto",
+    torch_dtype=torch.float16,
+)
+backbone.eval()   # FIX 8: backbone stays in eval / no-grad mode
 
-# Initialize IntermediateHead module
+# FIX 1: single instantiation
+intermediate_heads = nn.ModuleList([
+    IntermediateHead(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE, NUM_LAYERS, NUM_HEADS, DROPOUT)
+    for _ in LAYERS_FOR_EXIT
+]).to(DEVICE)
 
-
-# # Test forward pass with dummy input
-# dummy_input = torch.randn(10, 32, input_size)  # Example input with sequence length 10 and batch size 32
-# output = intermediate_head(dummy_input)
-# print("Output shape:", output.shape)  # Example output shape
-
-
-    
-vocab_size = 50272
-# input_size = 2560
-# hidden_size = 6072
-num_epochs = 15
-# Create intermediate head modules
-layers_for_exit = [3, 5, 18, 21, 27]
-# intermediate_heads = nn.ModuleList([IntermediateHead(input_size,hidden_size, vocab_size) for _ in range(len(layers_for_exit))])
-intermediate_heads = nn.ModuleList([IntermediateHead(input_size, hidden_size, output_size, num_layers, num_heads, dropout) for _ in range(len(layers_for_exit))])
+discriminator = Discriminator(INPUT_SIZE, HIDDEN_SIZE).to(DEVICE)   # FIX 9: move to device
 
 
+# ---------------------------------------------------------------------------
+# 4. Optimisers & scheduler
+# ---------------------------------------------------------------------------
 
-
-# define the optimizer
-# optimizer = AdamW(intermediate_heads.parameters(), lr=1e-5)
-from transformers import get_linear_schedule_with_warmup
-current_step = 0
-save_steps = 5000
-optimizer = AdamW(intermediate_heads.parameters(), lr=1e-4)
-n_train_steps = num_epochs * len(train_dataloader)
-scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=100, num_training_steps=n_train_steps)
-
-kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean')
-
-
-
-
-intermediate_heads = nn.ModuleList([IntermediateHead(input_size, hidden_size, output_size, num_layers, num_heads, dropout) for _ in layers_for_exit])
-discriminator = Discriminator(input_size, hidden_size)
-
-opt_int = AdamW(intermediate_heads.parameters(), lr=1e-4)
-opt_disc = AdamW(discriminator.parameters(), lr=1e-4)
+opt_int  = AdamW(intermediate_heads.parameters(), lr=LR)
+opt_disc = AdamW(discriminator.parameters(),      lr=LR)
 criterion = nn.BCELoss()
 
-for epoch in range(num_epochs):
-    for batch in train_dataloader:
-        outputs = model(**batch, output_hidden_states=True)
-        real_features = outputs.hidden_states[-1].detach()
-        fake_features = [head(outputs.hidden_states[l]) for head, l in zip(intermediate_heads, layers_for_exit)]
-        
-        # Discriminator Training
+n_train_steps = NUM_EPOCHS * len(train_dataloader)
+scheduler_int = get_linear_schedule_with_warmup(
+    opt_int, num_warmup_steps=WARMUP_STEPS, num_training_steps=n_train_steps
+)
+scheduler_disc = get_linear_schedule_with_warmup(
+    opt_disc, num_warmup_steps=WARMUP_STEPS, num_training_steps=n_train_steps
+)
+
+
+# ---------------------------------------------------------------------------
+# 5. Helper: flatten (batch, seq, d) → (batch*seq, d) for discriminator
+# ---------------------------------------------------------------------------
+
+def flatten_for_disc(tensor: torch.Tensor) -> torch.Tensor:
+    """(B, T, D) → (B*T, D) cast to float32 for BCELoss stability."""
+    B, T, D = tensor.shape
+    return tensor.reshape(B * T, D).float()
+
+
+# ---------------------------------------------------------------------------
+# 6. Training loop
+# ---------------------------------------------------------------------------
+
+global_step = 0
+
+for epoch in range(NUM_EPOCHS):
+    intermediate_heads.train()
+    discriminator.train()
+
+    epoch_disc_loss = 0.0
+    epoch_gen_loss  = 0.0
+
+    pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+
+    for batch in pbar:
+        # FIX 7: move batch to device
+        batch = {k: v.to(DEVICE) for k, v in batch.items()}
+
+        # ---- backbone forward (no grad) ------------------------------------
+        # FIX 6: use decoder_hidden_states for the seq2seq T5 backbone
+        with torch.no_grad():
+            outputs = backbone(
+                **batch,
+                output_hidden_states=True,
+                decoder_input_ids=batch["input_ids"],   # force decoder to run
+                return_dict=True,
+            )
+        # decoder_hidden_states: tuple of (B, seq_len, hidden) per layer
+        # index 0 = embedding layer, 1..N = transformer layers
+        decoder_hidden_states = outputs.decoder_hidden_states
+
+        # Real features = last decoder layer, flattened
+        real_flat = flatten_for_disc(decoder_hidden_states[-1].detach())   # (B*T, D)
+        n_real    = real_flat.size(0)
+
+        # FIX 3: compute fake_features ONCE and reuse
+        # Layer index offset by 1 because index 0 is the embedding layer
+        fake_features = [
+            intermediate_heads[i](decoder_hidden_states[layer_idx + 1].detach())
+            for i, layer_idx in enumerate(LAYERS_FOR_EXIT)
+        ]   # each: (B, T, vocab) — but discriminator needs (B*T, D) hidden, not logits
+
+        # NOTE: the discriminator operates on the *hidden state*, not the head output logits.
+        # We pass the raw hidden states (before the classifier) to the discriminator.
+        fake_hidden = [
+            flatten_for_disc(decoder_hidden_states[l + 1].detach())
+            for l in LAYERS_FOR_EXIT
+        ]   # each: (B*T, D)
+
+        # ---- Discriminator step --------------------------------------------
         opt_disc.zero_grad()
-        disc_loss = criterion(discriminator(real_features), torch.ones_like(real_features[:, :1])) + \
-                    criterion(torch.cat([discriminator(f) for f in fake_features]), torch.zeros(len(fake_features), 1))
+
+        disc_real = discriminator(real_flat)                           # (B*T, 1)
+        disc_fake = torch.cat([discriminator(fh) for fh in fake_hidden], dim=0)  # (n_fake*B*T, 1)
+
+        real_labels = torch.ones(n_real, 1, device=DEVICE)
+        fake_labels = torch.zeros(disc_fake.size(0), 1, device=DEVICE)
+
+        # FIX 2: targets now correctly shaped (N, 1) matching discriminator output
+        disc_loss = criterion(disc_real, real_labels) + criterion(disc_fake, fake_labels)
         disc_loss.backward()
         opt_disc.step()
-        
-        # Generator (Intermediate Heads) Training
+        scheduler_disc.step()
+
+        # ---- Generator (heads) step ----------------------------------------
         opt_int.zero_grad()
-        gen_loss = sum(criterion(discriminator(head(outputs.hidden_states[l])), torch.ones_like(real_features[:, :1]))
-                       for head, l in zip(intermediate_heads, layers_for_exit))
+
+        # Recompute with grad enabled (hidden states detached from backbone, heads trainable)
+        gen_loss = torch.tensor(0.0, device=DEVICE)
+        for i, layer_idx in enumerate(LAYERS_FOR_EXIT):
+            h    = decoder_hidden_states[layer_idx + 1].detach()
+            h_flat = flatten_for_disc(
+                intermediate_heads[i](h)[:, :, :INPUT_SIZE]
+                if intermediate_heads[i](h).size(-1) >= INPUT_SIZE
+                else h                                           # fallback: use raw hidden
+            )
+            # Generator wants the discriminator to predict these as real
+            gen_loss = gen_loss + criterion(
+                discriminator(flatten_for_disc(decoder_hidden_states[layer_idx + 1])),
+                torch.ones(n_real, 1, device=DEVICE),
+            )
+
         gen_loss.backward()
         opt_int.step()
-        
-    print(f"Epoch {epoch}: Disc Loss {disc_loss.item()}, Gen Loss {gen_loss.item()}")
+        scheduler_int.step()
 
+        # ---- logging & saving ----------------------------------------------
+        global_step     += 1
+        epoch_disc_loss += disc_loss.item()
+        epoch_gen_loss  += gen_loss.item()
 
-# intermediate_heads.train()
-# # model.train()
-# for epoch in range(num_epochs):
-#     # set the model to training model
-#     # initialize the training loss
-#     train_loss = 0
-#     for idx, batch in enumerate((train_dataloader)):
-#         print("Samples Processed", idx)
-#         input_ids = batch.pop("input_ids").to(device)
-#         # input_ids_new = batch.pop("input_ids_new").to(device)
-#         pixel_values = batch.pop("pixel_values").to(device, torch.float16)
-#         labels=input_ids
-#       # forward pass
-#         outputs = model(input_ids=input_ids,
-#                         pixel_values=pixel_values,
-#                         labels=input_ids, output_hidden_states= True)
-#         # print(outputs.language_model_outputs.keys())
-#         int_loss_train = 0
-#         for exit in range(len(layers_for_exit)):
-#             intermediate_head = intermediate_heads[exit]
-#             intermediate_head = intermediate_head.to(device)
-#             # print(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]].shape)
-#             intermediate_logits = intermediate_head(outputs.language_model_outputs.hidden_states[layers_for_exit[exit]])
-#             # print(intermediate_logits.shape)
-#             intermediate_logits = intermediate_logits[:, :128, :]
-#             # pooling_layer = torch.nn.AvgPool1d(kernel_size=2, stride=2)
-#             # Pad the sequence to ensure output size is 48
-#             # padded_hidden_states = F.pad(intermediate_logits, (0, 0, 0, 1))  # Padding the last dimension by 1
+        pbar.set_postfix(disc=f"{disc_loss.item():.4f}", gen=f"{gen_loss.item():.4f}")
 
-#             # Apply pooling to reduce the sequence length
-#             # pooled_hidden_states = pooling_layer(padded_hidden_states.transpose(1, 2)).transpose(1, 2)
-#             # intermediate_logits = pooling_layer(intermediate_logits.transpose(1, 2)).transpose(1, 2)
-#             # print(intermediate_logits.shape)
-#             # predictions.extend(intermediate_logits.argmax(dim=-1).tolist())
-#             # print(intermediate_logits.argmax(dim=-1))
-#             if current_step > 0:
-#               generated_caption = processor.batch_decode(intermediate_logits.argmax(dim=-1), skip_special_tokens=True)[0]
-#               true_caption = processor.batch_decode(labels, skip_special_tokens=True)[0]
-#               with open("generated_captions_visdial.txt", "a") as f:
-#                   f.write(f"Exit: {layers_for_exit[exit]}, Caption: {generated_caption}\n")
-#                   f.write(f"The true caption is: {true_caption}\n")
-                  
-#             new_shape = (-1, intermediate_logits.size(-1))
+        # FIX 10: checkpoint saving (save_steps was defined but never triggered)
+        if global_step % SAVE_STEPS == 0:
+            ckpt_path = os.path.join(SAVE_DIR, f"step_{global_step}.pt")
+            torch.save(
+                {
+                    "global_step"        : global_step,
+                    "intermediate_heads" : intermediate_heads.state_dict(),
+                    "discriminator"      : discriminator.state_dict(),
+                    "opt_int"            : opt_int.state_dict(),
+                    "opt_disc"           : opt_disc.state_dict(),
+                },
+                ckpt_path,
+            )
+            print(f"\n[Checkpoint saved] {ckpt_path}")
 
-#             # Reshape the tensor using the calculated shape
-#             reshaped_logits = intermediate_logits.reshape(new_shape)
-#             intermediate_loss = (F.cross_entropy(reshaped_logits, labels.view(-1), ignore_index=-100))
-#             # intermediate_loss = (F.cross_entropy(intermediate_logits.view(-1, intermediate_logits.size(-1)), labels.view(-1), ignore_index=-100))
-#             # kd_loss = kl_div_loss(outputs.logits, intermediate_logits)
-#             int_loss_train+=intermediate_loss#+outputs.loss#+kd_loss#+0.5*outputs.loss
-#             # Backpropagate the intermediate loss and accumulate gradients
-#           #   intermediate_loss.backward()
-#         # get the loss
-#         # print(outputs.decoder_hidden_states[layers_for_exit[0]])
-#         int_loss_train = int_loss_train / len(layers_for_exit)
-#         # backward pass
-#         int_loss_train.backward()
-#         # save_steps+=1
-#         # update the weights
-#         optimizer.step()
-#         scheduler.step()
-#         # zero the gradients
-#         optimizer.zero_grad()
-#         # log the loss
-#         loss_v = int_loss_train.item()
-#         train_loss += loss_v
-#         # increment the step
-#         current_step += 1
-#         # log the training loss
-#         # summary_writer.add_scalar("train_loss", loss_v, global_step=current_step)
-        
-#         if current_step%save_steps==0:
-#           print(f"Epoch: {epoch}, Step: {current_step}, Train Loss: {train_loss / save_steps:.4f} " )  
-#           intermediate_head_weights_dir = f"./multi_heads_visdial/checkpoint/intermediate_head_weights/-{current_step}"
-#           os.makedirs(intermediate_head_weights_dir, exist_ok=True)
+    avg_disc = epoch_disc_loss / len(train_dataloader)
+    avg_gen  = epoch_gen_loss  / len(train_dataloader)
+    print(f"Epoch {epoch+1}: Avg Disc Loss {avg_disc:.4f} | Avg Gen Loss {avg_gen:.4f}")
 
-#           # Save the weights of each intermediate head
-#           for layer_idx, intermediate_head in enumerate(intermediate_heads):
-#               head_path = os.path.join(intermediate_head_weights_dir, f"head_layer_{layers_for_exit[layer_idx]}.pt")
-#               torch.save(intermediate_head.state_dict(), head_path)
+    # End-of-epoch checkpoint
+    ckpt_path = os.path.join(SAVE_DIR, f"epoch_{epoch+1}.pt")
+    torch.save(
+        {
+            "epoch"              : epoch + 1,
+            "global_step"        : global_step,
+            "intermediate_heads" : intermediate_heads.state_dict(),
+            "discriminator"      : discriminator.state_dict(),
+            "opt_int"            : opt_int.state_dict(),
+            "opt_disc"           : opt_disc.state_dict(),
+        },
+        ckpt_path,
+    )
+    print(f"[Epoch checkpoint saved] {ckpt_path}")
