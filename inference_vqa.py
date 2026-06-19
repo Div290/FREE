@@ -1,44 +1,6 @@
 """
 Early Exit Inference — VQA (BLIP2-OPT-2.7b + LoRA + IntermediateHeads)
 ========================================================================
-Dataset   : Graphcore/vqa  (validation split)
-Backbone  : BLIP2-OPT-2.7b (fp16, sharded) + LoRA on [q_proj, k_proj]
-Exit heads: 5 × IntermediateHead (Transformer-decoder + linear classifier)
-            attached to OPT decoder layers [3, 5, 18, 21, 27]
-Training  : GAN-style — heads mimic the last-layer hidden-state distribution.
-
-Key difference from VisDial/COCO inference
-------------------------------------------
-VQA answers are almost always a single token (yes/no/number/short phrase).
-Inference therefore does a **single forward pass** (no autoregressive loop):
-
-  1. Run the full backbone once with output_hidden_states=True.
-  2. At each exit layer (shallow → deep), compute the head's output logits
-     for the *last* sequence position and evaluate confidence.
-  3. If confidence ≥ threshold → accept that head's argmax as the answer.
-  4. If no head fires → fall back to the full model's final logits.
-
-Supported confidence metrics
------------------------------
-  "max_prob"  – max softmax probability     (default, fast)
-  "entropy"   – normalised entropy          (lower entropy = more confident)
-  "margin"    – top-1 minus top-2 prob      (higher = more confident)
-
-CLI usage
----------
-  python inference_vqa_early_exit.py \\
-      --image     path/to/image.jpg \\
-      --question  "What color is the bus?" \\
-      --lora_ckpt ./lora_adapter/ \\
-      --heads_ckpt ./vqa_heads.pt \\
-      --threshold 0.90 \\
-      --method    max_prob
-
-Batch / evaluation usage
-------------------------
-  from inference_vqa_early_exit import load_models, batch_predict
-  processor, model, heads = load_models(lora_ckpt=..., heads_ckpt=...)
-  results = batch_predict(samples, processor, model, heads, threshold=0.90)
 """
 
 import argparse
